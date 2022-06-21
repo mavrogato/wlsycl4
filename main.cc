@@ -3,61 +3,86 @@
 #include <tuple>
 #include <string_view>
 
-// >>> TODO
-#define __cpp_impl_coroutine 1
-# include <coroutine>
-#undef  __cpp_impl_coroutine
-namespace std::inline experimental
-{
-    using std::coroutine_traits;
-    using std::coroutine_handle;
-}
-// <<< TODO
-
+#include <coroutine>
 #include <wayland-client.h>
 
 #include <CL/sycl.hpp>
 
-namespace
+inline namespace aux
 {
     template <class T>
-    struct filament {
+    struct task {
         struct promise_type {
-            void unhandled_exception() { throw; }
-            auto get_return_object() noexcept { return filament{*this}; }
-            auto initial_suspend() noexcept { return std::suspend_always{}; }
-            auto final_suspend() noexcept { return std::suspend_always{}; }
-            auto yield_value(T value) noexcept {
-                this->result = value;
-                return std::suspend_always{};
-            }
-            auto return_void() noexcept { }
+            std::coroutine_handle<> continuation;
             T result;
-        };
-        filament() = delete;
-        filament(filament const&) = delete;
-        filament(filament&& src)
-            : handle{std::exchange(src.handle, nullptr)}
-        {
-        }
-        filament& operator=(filament const&) = delete;
-        filament& operator=(filament&& src) {
-            if (this != &src) {
-                this->handle = std::exchange(src.handle, nullptr);
+            void unhandled_exception() { throw; }
+            auto get_return_object() { return task{*this}; }
+            auto initial_suspend() { return std::suspend_always{}; }
+            auto final_suspend() noexcept {
+                struct awaiter {
+                    bool await_ready() noexcept { return false; }
+                    void await_resume() noexcept { }
+                    auto await_suspend(std::coroutine_handle<promise_type> handle) noexcept {
+                        /*
+                          awaiter::await_suspend is called when the execution of the 
+                          current coroutine (referred to by 'handle') is about to finish.
+                          If the current coroutine was resumed by another coroutine via
+                          co_await get_task(), a handle to that coroutine has been stored
+                          as handle.promise().continuation. In that case, return the handle
+                          to resume the previous coroutine.
+                          Otherwise, return noop_coroutine(), whose resumption does nothing.
+                        */
+                        if (auto continuation = handle.promise().continuation) {
+                            return continuation;
+                        }
+                        else {
+                            continuation = std::noop_coroutine();
+                            return continuation;
+                        }
+                    }
+                };
+                return awaiter{};
             }
-            return *this;
-        }
-        ~filament() noexcept { if (this->handle) this->handle.destroy(); }
-        T step() const noexcept {
-            this->handle.resume();
-            return this->handle.promise().result;
-        }
+            void return_value(T value) noexcept { this->result = std::move(value); }
+        };
 
     private:
-        explicit filament(promise_type& p) noexcept
+        explicit task(promise_type& p) noexcept
             : handle{std::coroutine_handle<promise_type>::from_promise(p)}
         {
         }
+
+    public:
+        task(task const&) = delete;
+        task(task&& rhs) noexcept
+            : handle{std::exchange(rhs.handle, nullptr)}
+        {
+        }
+        auto operator co_await() noexcept {
+            struct awaiter {
+                bool await_ready() noexcept {
+                    return false;
+                }
+                T await_resume() noexcept {
+                    return std::move(this->handle.promise().result);
+                }
+                auto await_suspend() noexcept {
+                    this->handle.promise().continuation = handle;
+                    return this->handle;
+                }
+                std::coroutine_handle<promise_type> handle;
+            };
+            return awaiter{this->handle};
+        }
+        T operator()() noexcept {
+            this->handle.resume();
+            return std::move(this->handle.promise().result);
+        }
+        ~task() noexcept {
+            if (this->handle) this->handle.destroy();
+        }
+
+    private:
         std::coroutine_handle<promise_type> handle;
     };
 }
@@ -112,5 +137,12 @@ int main() {
     if (auto display = wl_display_connect(nullptr)) {
         with_display(display);
     }
+
+    auto v = []() -> aux::task<int> {
+        co_return 42;
+    }();
+
+    std::cout << v() << std::endl;
+
     return 0;
 }
